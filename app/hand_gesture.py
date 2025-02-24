@@ -3,7 +3,87 @@ import mediapipe as mp
 import pyautogui
 import numpy as np
 import time
+# 在导入部分添加 CUDA 支持
+import cv2
+import mediapipe as mp
+import pyautogui
+import numpy as np
+import time
+import torch
+import numba
+from numba import cuda
 
+# 检查是否支持CUDA
+CUDA_AVAILABLE = torch.cuda.is_available()
+if CUDA_AVAILABLE:
+    print(f"GPU 加速已启用: {torch.cuda.get_device_name(0)}")
+
+# 使用 Numba 优化距离计算
+@numba.jit(nopython=True, fastmath=True)
+def calculate_distance(x1, y1, x2, y2):
+    """使用 Numba 优化的距离计算"""
+    return np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
+class MouseControl:
+    def __init__(self):
+        self.last_smooth_x = screen_width / 2
+        self.last_smooth_y = screen_height / 2
+        self.last_move_time = time.time()
+        # 添加坐标缓存
+        self.coord_buffer_x = np.zeros(5)
+        self.coord_buffer_y = np.zeros(5)
+        self.buffer_index = 0
+        
+    @numba.jit(forceobj=True)
+    def _apply_nonlinear_mapping(self, y, max_height):
+        """使用 Numba 优化的非线性映射"""
+        normalized_y = y / max_height
+        mapped_y = normalized_y ** 1.2
+        return mapped_y * max_height
+
+    def move_mouse(self, x, y, frame_width, frame_height):
+        move_interval = 0.05
+
+        if time.time() - self.last_move_time >= move_interval:
+            # 使用坐标缓冲进行平滑处理
+            self.coord_buffer_x[self.buffer_index] = x
+            self.coord_buffer_y[self.buffer_index] = y
+            self.buffer_index = (self.buffer_index + 1) % 5
+
+            # 计算平滑后的坐标
+            x = np.median(self.coord_buffer_x)
+            y = np.median(self.coord_buffer_y)
+
+            vertical_scale = 2.5  # 增加垂直缩放
+            horizontal_scale = 1.2
+            y_offset = frame_height * 0.25  # 增加偏移量
+            
+            # 使用 Numba 优化的计算
+            adjusted_y = max(0, y - y_offset)
+            
+            target_mouse_x = np.clip((screen_width - (x / frame_width) * screen_width * horizontal_scale), 0, screen_width)
+            target_mouse_y = np.clip((adjusted_y / frame_height) * screen_height * vertical_scale, 0, screen_height)
+            
+            # 应用优化后的非线性映射
+            target_mouse_y = self._apply_nonlinear_mapping(target_mouse_y, screen_height)
+            
+            # 使用自适应平滑因子
+            velocity = np.sqrt((target_mouse_x - self.last_smooth_x)**2 + 
+                             (target_mouse_y - self.last_smooth_y)**2)
+            adaptive_smoothing = min(0.8, max(0.3, 1.0 - velocity / 1000))
+            
+            smooth_x = self.last_smooth_x * (1 - adaptive_smoothing) + target_mouse_x * adaptive_smoothing
+            smooth_y = self.last_smooth_y * (1 - adaptive_smoothing) + target_mouse_y * adaptive_smoothing
+
+            # 确保坐标在屏幕范围内
+            smooth_x = np.clip(smooth_x, 0, screen_width)
+            smooth_y = np.clip(smooth_y, 0, screen_height)
+
+            self.last_smooth_x = smooth_x
+            self.last_smooth_y = smooth_y
+            pyautogui.moveTo(smooth_x, smooth_y)
+            self.last_move_time = time.time()
+            
 # 设置 MediaPipe 手部检测模块
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)  # 不需要 use_gpu 参数
@@ -31,39 +111,51 @@ smoothing_factor = 0.5  # 越小越平滑，越大越快响应
 
 class MouseControl:
     def __init__(self):
-        # 初始化历史位置
         self.last_smooth_x = screen_width / 2
         self.last_smooth_y = screen_height / 2
         self.last_move_time = time.time()
 
     def move_mouse(self, x, y, frame_width, frame_height):
-        # 设定移动频率
-        move_interval = 0.05  # 每 50 毫秒才移动一次
+        move_interval = 0.05
 
         if time.time() - self.last_move_time >= move_interval:
-            # 获取当前鼠标位置
             current_mouse_x, current_mouse_y = pyautogui.position()
 
-            # 计算目标鼠标位置
-            target_mouse_x = np.clip((screen_width - (x / frame_width) * screen_width), 0, screen_width)
-            target_mouse_y = (y / frame_height) * screen_height
+            # 增加垂直缩放系数
+            vertical_scale = 2.0  # 从1.5增加到2.0
+            horizontal_scale = 1.2
 
-            # 使用插值平滑（线性插值）
-            smooth_x = current_mouse_x + (target_mouse_x - current_mouse_x) * interpolation_factor
-            smooth_y = current_mouse_y + (target_mouse_y - current_mouse_y) * interpolation_factor
+            # 修改Y轴映射方式，添加偏移量使手势范围向上延伸
+            y_offset = frame_height * 0.2  # 添加20%的向上偏移
+            adjusted_y = max(0, y - y_offset)
+            
+            target_mouse_x = np.clip((screen_width - (x / frame_width) * screen_width * horizontal_scale), 0, screen_width)
+            target_mouse_y = np.clip((adjusted_y / frame_height) * screen_height * vertical_scale, 0, screen_height)
+
+            # 使用更激进的非线性映射
+            target_mouse_y = self._apply_nonlinear_mapping(target_mouse_y, screen_height)
 
             # 使用平滑（EMA）
             smooth_x = self.last_smooth_x * (1 - smoothing_factor) + target_mouse_x * smoothing_factor
             smooth_y = self.last_smooth_y * (1 - smoothing_factor) + target_mouse_y * smoothing_factor
 
-            # 更新历史位置
+            # 确保坐标在屏幕范围内
+            smooth_x = np.clip(smooth_x, 0, screen_width)
+            smooth_y = np.clip(smooth_y, 0, screen_height)
+
             self.last_smooth_x = smooth_x
             self.last_smooth_y = smooth_y
-
-            # 移动鼠标到平滑后的目标位置
             pyautogui.moveTo(smooth_x, smooth_y)
             self.last_move_time = time.time()
 
+    def _apply_nonlinear_mapping(self, y, max_height):
+        """使用更激进的非线性映射"""
+        normalized_y = y / max_height
+        # 使用更小的指数来增强上部区域的精确度
+        mapped_y = normalized_y ** 1.2  # 从1.5减小到1.2
+        return mapped_y * max_height
+        
+        
 # 设置点击动作
 def left_click():
     pyautogui.click(button='left')
@@ -194,7 +286,7 @@ def start_hand_gesture_control():
                         pass
 
                     # 判断大拇指与小指是否对碰，模拟双击鼠标左键
-                    thumb_pinky_distance = np.sqrt((thumb_x - pinky_x) ** 2 + (thumb_y - pinky_y) ** 2)
+                    thumb_pinky_distance = np.sqrt((thumb_x - pinky_x) ** 2 + 2 * (thumb_y - pinky_y) ** 2)
                     if thumb_pinky_distance < gesture_distance_threshold:
                         if time.time() - last_gesture_time > click_delay:
                             double_click()  # 模拟双击
